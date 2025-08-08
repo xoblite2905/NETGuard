@@ -18,7 +18,7 @@ jobs:
         uses: actions/setup-node@v3
         with:
           node-version: '16' # change as needed
-      - name: Install dependencies
-        run: npm install
+      - name: Build and start containers
+        run: docker-compose --env-file .env up --build -d
       - name: Run tests
         run: npm test

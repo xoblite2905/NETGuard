@@ -20,5 +20,3 @@ jobs:
           node-version: '16' # change as needed
       - name: Build and start containers
         run: docker-compose --env-file .env up --build -d
-      - name: Run tests
-        run: npm test

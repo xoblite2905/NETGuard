@@ -1,0 +1,12 @@
+# Dockerfile.tcpdump
+
+FROM debian:stable-slim
+
+# Install tshark, tcpdump, and coreutils (which provides stdbuf)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tshark \
+    tcpdump \
+    coreutils
+
+# Clean up the package lists to keep the final image small
+RUN rm -rf /var/lib/apt/lists/*

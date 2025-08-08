@@ -1,0 +1,68 @@
+# Dockerfile.netguard (v1.8 - Final Attempt)
+FROM node:18.19.1-bullseye AS builder
+WORKDIR /app
+
+# 1. Copy the package files
+COPY package.json ./
+COPY package-lock.json ./
+
+# 2. THIS IS THE FIX: Copy the pre-installed node_modules from the host
+#    instead of trying to run 'npm install' inside the container.
+COPY ./node_modules ./node_modules
+
+# 3. Copy the rest of the application code
+COPY ./src ./src
+COPY ./public ./public
+COPY ./tailwind.config.js ./tailwind.config.js
+COPY ./postcss.config.js ./postcss.config.js
+
+# 4. Now, run the build, which will use the copied modules.
+RUN npm run build
+
+
+# --- Stage 2: Build the Final Production Image ---
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN set -e && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        tshark \
+        nmap \
+        netcat-openbsd \
+        wget \
+        unzip \
+    && \
+    echo "--- Downloading and installing Nuclei v3.2.3 ---" && \
+    wget https://github.com/projectdiscovery/nuclei/releases/download/v3.2.3/nuclei_3.2.3_linux_amd64.zip -O nuclei.zip && \
+    unzip nuclei.zip && \
+    mv nuclei /usr/local/bin/nuclei && \
+    chmod +x /usr/local/bin/nuclei && \
+    echo "--- Cleaning up installation files ---" && \
+    rm nuclei.zip && \
+    echo "--- Updating Nuclei templates ---" && \
+    nuclei -update-templates && \
+    echo "--- Removing temporary packages ---" && \
+    apt-get purge -y --auto-remove wget unzip && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY ./backend/requirements.txt .
+# This pip install block is fine and handles network errors well.
+RUN python -m pip install --upgrade pip && \
+    pip install \
+      --no-cache-dir \
+      --default-timeout=100 \
+      --retries 5 \
+      -r requirements.txt
+
+# This copies the entire backend directory, including your 'app' folder.
+COPY ./backend /app
+
+# Copy the built frontend from the 'builder' stage
+COPY --from=builder /app/build ./build
+
+# Define the command to run the application
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]

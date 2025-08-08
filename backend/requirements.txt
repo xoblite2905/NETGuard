@@ -1,0 +1,43 @@
+elasticsearch
+schedule # <-- ADDED for the security monitor scheduler
+
+# GVM/OpenVAS Integration
+python-gvm # <-- ADDED for the gvm_scanner service
+
+# Core web framework
+fastapi==0.95.0
+uvicorn==0.23.0
+
+# Database
+sqlalchemy==2.0.17
+pg8000
+
+# Security and Auth
+python-jose[cryptography]
+passlib[bcrypt]
+thehive4py
+
+# Network and System tools
+python-nmap==0.7.1
+scapy==2.5.0
+geoip2
+python-magic
+psutil # <-- Version number removed for better compatibility
+watchdog
+
+# Other Dependencies
+# Note: Removed specific versions for common libraries to avoid dependency conflicts.
+# pip will resolve the best compatible versions.
+anyio
+click
+greenlet
+h11
+idna
+Jinja2
+MarkupSafe
+pydantic
+PyMySQL
+python-dotenv
+sniffio
+starlette
+typing_extensions

@@ -1,0 +1,29 @@
+# We are NOT using the strict 'zeek' module anymore.
+# We are using a robust 'filestream' input that waits for files to exist.
+filebeat.inputs:
+  - type: filestream
+    id: zeek-json-logs
+    enabled: true
+    # This path will watch for ANY file ending in .log inside the shared log directory.
+    # It will not crash if the directory is empty at startup.
+    paths:
+      - /var/log/zeek/*.log
+    parsers:
+      - ndjson:
+          keys_under_root: true
+          add_error_key: true
+
+  # Your existing Suricata input is preserved.
+  - type: filestream
+    id: suricata-json
+    enabled: true
+    paths:
+      - /var/log/suricata/eve.json
+    json: {keys_under_root: true, add_error_key: true}
+
+# The rest of your configuration remains the same.
+output.elasticsearch:
+  hosts: ["elasticsearch:9200"]
+
+setup.kibana:
+  host: "kibana:5601"

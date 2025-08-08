@@ -1,0 +1,294 @@
+services:
+  # === The Antenna: Primary Packet Capturer ===
+  tcpdump-sniffer:
+    build:
+      context: .
+      dockerfile: Dockerfile.tcpdump
+    container_name: tcpdump-sniffer
+    network_mode: "host"
+    user: root
+    cap_add: [ "NET_ADMIN", "NET_RAW" ]
+    volumes: [ "./packet_stream:/stream:rw" ]
+    env_file: .env
+    command: >
+      sh -c "
+        # ... startup checks are correct ...
+        
+        echo '[SUCCESS] Interface ${IFACE} found.'
+        echo '[INFO] Starting tshark and tcpdump producers with forced line-buffering...'
+
+        # ### --- THE BUFFERING FIX --- ###
+        # Use stdbuf -oL to force tshark to flush each line of JSON as it's created.
+        stdbuf -oL tshark -i ${IFACE} -l -T ek > /stream/scapy.pcap &
+        
+        tcpdump -i ${IFACE} -U -w /stream/zeek.pcap &
+        
+        wait
+      "
+    restart: on-failure
+
+  # === Elastic Stack ===
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.20
+    container_name: elasticsearch
+    environment: ["discovery.type=single-node", "ES_JAVA_OPTS=-Xms1g -Xmx1g"]
+    ports: ["9200:9200"]
+    volumes: ["es_data:/usr/share/elasticsearch/data"]
+    networks: ["netguard-net"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:7.17.20
+    container_name: kibana
+    ports: ["5601:5601"]
+    environment: ["ELASTICSEARCH_HOSTS=http://elasticsearch:9200"]
+    depends_on: { elasticsearch: { condition: service_started } }
+    restart: on-failure
+    networks: ["netguard-net"]
+
+  # === Database ===
+  db:
+    image: postgres:15-alpine
+    container_name: postgres_db
+    restart: unless-stopped
+    ports: ["127.0.0.1:5432:5432"]
+    environment: ["POSTGRES_USER=${POSTGRES_USER}", "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}", "POSTGRES_DB=${POSTGRES_DB}"]
+    volumes: ["postgres_data:/var/lib/postgresql/data", "./init.sql:/docker-entrypoint-initdb.d/init.sql"]
+    networks: ["netguard-net"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # === NetGuard Application (Consumer) ===
+  netguard_app:
+    build: { context: ., dockerfile: Dockerfile.netguard }
+    container_name: netguard_app
+    network_mode: "host"
+    #ports: ["8080:8080"]
+    volumes: ["./packet_stream:/stream:ro"]
+    depends_on:
+      db: { condition: service_healthy }
+      elasticsearch: { condition: service_healthy }
+      tcpdump-sniffer: { condition: service_started }
+    cap_add: ["NET_ADMIN", "NET_RAW"]
+    environment:
+      - IFACE=${IFACE}
+      - SCAN_TARGET_CIDR=${SCAN_TARGET_CIDR}
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_DRIVER=${DB_DRIVER}
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_NAME=${POSTGRES_DB}
+      - ELASTICSEARCH_URI=${ELASTICSEARCH_URI}
+      - GVM_ADMIN_USER=${GVM_ADMIN_USER}
+      - GVM_ADMIN_PASSWORD=${GVM_ADMIN_PASSWORD}
+      - DATABASE_URL=${DATABASE_URL}
+      - PYTHONUNBUFFERED=1
+    command: >
+      sh -c "
+        echo 'NetGuard App: Dependencies are healthy, starting...' &&
+        python -m app.create_db &&
+        echo 'Database tables are ready. Starting application server...' &&
+        uvicorn app.main:app --host 0.0.0.0 --port 8080
+      "
+
+  # === Network Monitoring (Consumers) ===
+  zeek:
+    image: zeek/zeek:6.2.1
+    container_name: zeek
+    restart: on-failure
+    working_dir: /usr/local/zeek/logs # <-- ADD THIS LINE
+    network_mode: "host"
+    cap_add: [ "NET_ADMIN", "NET_RAW" ]
+    env_file: .env
+    volumes:
+    - ./packet_stream:/stream:ro
+    - zeek_logs:/usr/local/zeek/logs  # <-- CORRECT PATH
+    - ./local.zeek:/usr/local/zeek/share/zeek/site/local.zeek:ro
+    entrypoint: /usr/local/zeek/bin/zeek
+    command: [ "-i", "${IFACE}", "local.zeek" ]
+    depends_on: [tcpdump-sniffer]
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:7.17.20
+    container_name: filebeat
+    depends_on: {elasticsearch: {condition: service_healthy}, zeek: {condition: service_started}}
+    user: root
+    restart: on-failure
+    volumes:
+      - ./filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - zeek_logs:/var/log/zeek:ro
+      - suricata_logs:/var/log/suricata:ro
+    networks: ["netguard-net"]
+    command: filebeat -e -strict.perms=false
+
+  suricata:
+    image: jasonish/suricata:latest
+    container_name: suricata
+    restart: on-failure
+    network_mode: "host"
+    cap_add: [ "NET_ADMIN", "NET_RAW", "SYS_NICE" ]
+    volumes:
+      - suricata_logs:/var/log/suricata
+    command: suricata -i ${IFACE}
+
+  # === Greenbone GVM Stack ===
+  vulnerability-tests:
+    image: registry.community.greenbone.net/community/vulnerability-tests:latest
+    volumes:
+      - vt_data_vol:/mnt
+    networks:
+      - gvm-net
+
+  notus-data:
+    image: registry.community.greenbone.net/community/notus-data:latest
+    volumes:
+      - notus_data_vol:/mnt
+    networks:
+      - gvm-net
+
+  scap-data:
+    image: registry.community.greenbone.net/community/scap-data:latest
+    volumes:
+      - scap_data_vol:/mnt
+    networks:
+      - gvm-net
+
+  cert-bund-data:
+    image: registry.community.greenbone.net/community/cert-bund-data:latest
+    volumes:
+      - cert_data_vol:/mnt
+    networks:
+      - gvm-net
+
+  dfn-cert-data:
+    image: registry.community.greenbone.net/community/dfn-cert-data:latest
+    volumes:
+      - cert_data_vol:/mnt
+    depends_on:
+      - cert-bund-data
+    networks:
+      - gvm-net
+
+  data-objects:
+    image: registry.community.greenbone.net/community/data-objects:latest
+    volumes:
+      - data_objects_vol:/mnt
+    networks:
+      - gvm-net
+
+  report-formats:
+    image: registry.community.greenbone.net/community/report-formats:latest
+    volumes:
+      - data_objects_vol:/mnt
+    depends_on:
+      - data-objects
+    networks:
+      - gvm-net
+
+  gpg-data:
+    image: registry.community.greenbone.net/community/gpg-data:latest
+    volumes:
+      - gpg_data_vol:/mnt
+    networks:
+      - gvm-net
+
+  redis-server:
+    image: registry.community.greenbone.net/community/redis-server:latest
+    restart: on-failure
+    volumes:
+      - redis_socket_vol:/run/redis/
+    networks:
+      - gvm-net
+
+  pg-gvm:
+    image: registry.community.greenbone.net/community/pg-gvm:stable
+    restart: on-failure
+    volumes:
+      - psql_data_vol:/var/lib/postgresql
+      - psql_socket_vol:/var/run/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gvm-net
+
+  gvmd:
+    image: registry.community.greenbone.net/community/gvmd:stable
+    restart: on-failure
+    ports:
+      - "127.0.0.1:9392:9392"
+    environment:                           # <-- ADD THIS BLOCK
+      - POSTGRES_HOST=pg-gvm
+    volumes:
+      - gvmd_data_vol:/var/lib/gvm
+      - scap_data_vol:/var/lib/gvm/scap-data/
+      - cert_data_vol:/var/lib/gvm/cert-data
+      - data_objects_vol:/var/lib/gvm/data-objects/gvmd
+      - vt_data_vol:/var/lib/openvas/plugins
+      - gvmd_socket_vol:/run/gvmd
+      - ospd_openvas_socket_vol:/run/ospd
+    depends_on:
+      pg-gvm:
+        condition: service_healthy
+    networks:
+      - gvm-net
+
+  mqtt-broker:
+    image: registry.community.greenbone.net/community/mqtt-broker:latest
+    restart: on-failure
+    networks:
+      - gvm-net
+
+  ospd-openvas:
+    image: registry.community.greenbone.net/community/ospd-openvas:stable
+    restart: on-failure
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    volumes:
+      - gpg_data_vol:/etc/openvas/gnupg
+      - vt_data_vol:/var/lib/openvas/plugins
+      - notus_data_vol:/var/lib/notus
+      - ospd_openvas_socket_vol:/run/ospd
+      - redis_socket_vol:/run/redis/
+    depends_on:
+      - redis-server
+    networks:
+      - gvm-net
+
+# === Volumes ===
+volumes:
+  es_data: {}
+  zeek_logs: {}
+  postgres_data: {}
+  gpg_data_vol: {}
+  scap_data_vol: {}
+  cert_data_vol: {}
+  data_objects_vol: {}
+  gvmd_data_vol: {}
+  psql_data_vol: {}
+  vt_data_vol: {}
+  notus_data_vol: {}
+  psql_socket_vol: {}
+  gvmd_socket_vol: {}
+  ospd_openvas_socket_vol: {}
+  redis_socket_vol: {}
+  suricata_logs: {}
+
+# === Networks ===
+networks:
+  netguard-net: {}
+  gvm-net: {}
